@@ -23,6 +23,7 @@ import {
   clipSchema,
   clipUpdateSchema,
 } from '@history/contracts';
+import { PeakCacheService } from '@history/waveform';
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const ALLOWED_AUDIO_EXTENSIONS = /\.(aac|aiff|flac|m4a|mp3|mp4|oga|ogg|opus|wav|webm)$/i;
@@ -91,6 +92,13 @@ const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
 redis.on('error', (error) => app.log.warn({ err: error }, 'Redis connection error'));
 
 const mediaQueue = new Queue('media', { connection: redis });
+
+// 波形峰值缓存：缓存文件落在 storage/waveform，多分辨率读取。
+// 重建期间默认等待新结果；如需要 SWR 语义，调用方可传 stale=1。
+const waveformService = new PeakCacheService({
+  cacheDir: path.join(storage, 'waveform'),
+  samplesPerPeak: Number(process.env.WAVEFORM_SAMPLES_PER_PEAK) || 256,
+});
 
 await app.register(cors, {
   origin: webOrigins,
@@ -535,6 +543,90 @@ app.get('/v1/recordings/:id/file', async (req, reply) => {
     .header('Content-Length', range.end - range.start + 1)
     .header('Content-Range', `bytes ${range.start}-${range.end}/${fileStat.size}`)
     .send(createReadStream(filePath, { start: range.start, end: range.end }));
+});
+
+// 多分辨率波形峰值：
+//   GET /v1/recordings/:id/waveform?width=1200&startMs=0&endMs=...&level=&stale=1
+// - 首次访问流式扫描整个音频并构建缓存（只产生一次完整结果，构建中绝不返回半成品）；
+// - 重建期间默认等待新结果；stale=1 时若有旧快照则立即返回并带 X-Waveform-Stale: true；
+// - 响应头 X-Waveform-Status: hit|miss|rebuild，X-Waveform-Level 表示实际使用的金字塔层。
+app.get('/v1/recordings/:id/waveform', async (req, reply) => {
+  const recordingId = (req.params as { id: string }).id;
+  const recording = await prisma.recording.findUnique({ where: { id: recordingId } });
+  if (!recording) {
+    throw new HttpError(404, 'NOT_FOUND', '录音不存在');
+  }
+
+  const user = await resolveRequestUser(req);
+  if (!user || !(await findMembership(recording.workspaceId, user.id))) {
+    throw new HttpError(404, 'NOT_FOUND', '录音不存在');
+  }
+
+  if (recording.status !== 'READY') {
+    throw new HttpError(409, 'WAVEFORM_UNAVAILABLE', '录音尚未处理完成，波形暂不可用');
+  }
+
+  const query = (req.query ?? {}) as Record<string, unknown>;
+  const parseOptionalInt = (value: unknown, name: string): number | undefined => {
+    if (value === undefined || value === '') return undefined;
+    const n = Number(value);
+    if (!Number.isInteger(n)) throw new HttpError(400, 'INVALID_INPUT', `${name} 必须是整数`);
+    return n;
+  };
+  const width = parseOptionalInt(query.width, 'width') ?? 1200;
+  const startMs = parseOptionalInt(query.startMs, 'startMs');
+  const endMs = parseOptionalInt(query.endMs, 'endMs');
+  const level = parseOptionalInt(query.level, 'level');
+  const staleWhileRebuild = query.stale === '1' || query.stale === 'true';
+
+  if (width <= 0 || width > 100_000) {
+    throw new HttpError(400, 'INVALID_INPUT', 'width 取值范围为 1..100000');
+  }
+  if ((startMs !== undefined && startMs < 0) || (endMs !== undefined && endMs < 0)) {
+    throw new HttpError(400, 'INVALID_INPUT', '时间范围不能为负');
+  }
+  if (startMs !== undefined && endMs !== undefined && endMs < startMs) {
+    throw new HttpError(400, 'INVALID_INPUT', 'endMs 不能早于 startMs');
+  }
+
+  const before = waveformService.peek(recordingId);
+  try {
+    const result = await waveformService.read(recording.id, recording.playbackPath || recording.originalPath, {
+      width,
+      startMs,
+      endMs,
+      level,
+      staleWhileRebuild,
+    });
+
+    const status = before.state === 'empty' || before.state === 'failed' ? 'miss' : result.stale || before.state === 'building' ? 'rebuild' : 'hit';
+    reply
+      .header('X-Waveform-Status', status)
+      .header('X-Waveform-Level', String(result.level))
+      .header('X-Waveform-Stale', result.stale ? 'true' : 'false')
+      .header('Cache-Control', 'private, max-age=60');
+
+    return {
+      data: {
+        recordingId: recording.id,
+        level: result.level,
+        width,
+        durationMs: result.durationMs,
+        startMs: result.startMs,
+        endMs: result.endMs,
+        stale: result.stale,
+        // 归一化的 [-1,1] 峰值对，前端直接映射到像素高度。
+        peaks: result.buckets.map((bucket) => [bucket.min, bucket.max]),
+      },
+    };
+  } catch (error) {
+    req.log.warn({ err: error, recordingId }, 'waveform build/read failed');
+    throw new HttpError(
+      422,
+      'WAVEFORM_DECODE_FAILED',
+      '波形生成失败：音频无法解码或文件不可读',
+    );
+  }
 });
 
 app.get('/v1/recordings/:id/clips', { preHandler: authenticate }, async (req) => {

@@ -28,6 +28,9 @@ importers:
       '@history/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@history/waveform':
+        specifier: workspace:*
+        version: link:../../packages/waveform
       '@prisma/client':
         specifier: ^6.0.1
         version: 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)
@@ -93,6 +96,9 @@ importers:
 
   apps/worker:
     dependencies:
+      '@history/waveform':
+        specifier: workspace:*
+        version: link:../../packages/waveform
       '@prisma/client':
         specifier: ^6.0.1
         version: 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)
@@ -125,6 +131,21 @@ importers:
         specifier: ^3.23.8
         version: 3.25.76
     devDependencies:
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.5
+        version: 2.1.9(@types/node@22.20.2)
+
+  packages/waveform:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.9.0
+        version: 22.20.2
+      fastify:
+        specifier: ^5.1.0
+        version: 5.12.3
       typescript:
         specifier: ^5.6.3
         version: 5.9.3

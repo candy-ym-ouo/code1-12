@@ -4,11 +4,27 @@ import { PrismaClient } from '@prisma/client';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseFile } from 'music-metadata';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { PeakCacheService } from '@history/waveform';
 
 const execFileAsync = promisify(execFile);
 const prisma = new PrismaClient();
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
   maxRetriesPerRequest: null,
+});
+
+// 波形峰值缓存与 API 使用同一目录，worker 负责在录音 READY 后预热；
+// 预热失败不影响录音上线（API 首次访问时会惰性重建）。
+const currentDir = path.dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = path.resolve(currentDir, '../../..');
+const configuredStorage = process.env.STORAGE_DIR || './storage';
+const storageDir = path.isAbsolute(configuredStorage)
+  ? configuredStorage
+  : path.resolve(repositoryRoot, configuredStorage);
+const waveformService = new PeakCacheService({
+  cacheDir: path.join(storageDir, 'waveform'),
+  samplesPerPeak: Number(process.env.WAVEFORM_SAMPLES_PER_PEAK) || 256,
 });
 
 async function probeWithFfprobe(filePath: string): Promise<number> {
@@ -74,15 +90,25 @@ async function processMediaJob(job: Job) {
   const durationMs = await probeDurationMs(recording.originalPath);
   if (durationMs <= 0) throw new Error('音频时长为 0，无法进入编辑');
 
+  const playbackPath = recording.playbackPath || recording.originalPath;
   await prisma.recording.update({
     where: { id: recordingId },
     data: {
       status: 'READY',
       durationMs,
-      playbackPath: recording.playbackPath || recording.originalPath,
+      playbackPath,
       processingError: null,
     },
   });
+
+  // 预热波形峰值缓存。失败只记录，不把任务标记失败——
+  // API 的波形接口在下次访问时会惰性重建。
+  try {
+    await waveformService.rebuild(recordingId, playbackPath);
+    console.log(`waveform peaks warmed for ${recordingId}`);
+  } catch (waveformError) {
+    console.error(`waveform warmup failed for ${recordingId}:`, waveformError);
+  }
 
   return { recordingId, durationMs };
 }
